@@ -1,8 +1,8 @@
 -- ============================================================
 -- Componente: contador.vhd
--- Descripcion: Contador up generico con enable, reset y flag
---              de terminacion (done). Reutilizado en todos
---              los modulos del sistema.
+-- Descripcion: Contador up generico con enable, reset sincrono
+--              y flag de terminacion (done).
+--              Reutilizado en todos los modulos del sistema.
 -- ============================================================
 library ieee;
 use ieee.std_logic_1164.all;
