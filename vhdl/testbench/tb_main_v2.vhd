@@ -21,9 +21,9 @@
 --   9. Test de reset durante inferencia activa
 --  10. Resumen estadistico final automatizado
 --
--- ARCHIVOS REQUERIDOS (Configurados con ruta absoluta completa):
---   /home/hssr/Downloads/Codigos/NeuroVHDL/test_images.txt  -- pixeles en binario (8b por linea, 784 x N)
---   /home/hssr/Downloads/Codigos/NeuroVHDL/test_labels.txt  -- etiquetas decimales (0..9, una por linea)
+-- ARCHIVOS REQUERIDOS (en directorio de simulacion):
+--   test_images.txt  -- pixeles en binario (8b por linea, 784 x N)
+--   test_labels.txt  -- etiquetas decimales (0..9, una por linea)
 --
 -- PARAMETROS CONFIGURABLES:
 --   CLK_PERIOD   : periodo de reloj (10 ns = 100 MHz)
@@ -283,11 +283,11 @@ begin
         end if;
 
         -- =====================================================
-        -- FASE 2: Abrir archivos de datos (RUTAS ABSOLUTAS)
+        -- FASE 2: Abrir archivos de datos
         -- =====================================================
 
-        file_open(f_images, "/home/hssr/Downloads/Codigos/NeuroVHDL/vhdl/testbench/test_images.txt", read_mode);
-        file_open(f_labels, "/home/hssr/Downloads/Codigos/NeuroVHDL/vhdl/testbench/test_labels.txt", read_mode);
+        file_open(f_images, "test_images.txt", read_mode);
+        file_open(f_labels, "test_labels.txt", read_mode);
 
         report "======================================================" severity note;
         report " Iniciando bucle de inferencias CNN" severity note;
@@ -565,9 +565,9 @@ begin
                 assert done_cnt <= 2
                     report "[WARN] 'done' activo mas de 2 ciclos consecutivos"
                     severity warning;
+            else
+                done_cnt := 0;
             end if;
-        else
-            done_cnt := 0;
         end if;
     end process;
 
