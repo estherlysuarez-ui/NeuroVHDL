@@ -1,19 +1,5 @@
 -- ============================================================
--- Modulo: maxpool.vhd (REFACTORIZADO)
--- Descripcion:
---   MaxPooling 2x2 completamente estructural.
---   No contiene lógica de control ni contadores internos.
---
--- Arquitectura:
---
---   maxpool
---   ├── maxpool_counters
---   ├── maxpool_controller
---   ├── line buffer (ram_sp)
---   ├── registros (left_cur, left_top)
---   └── max_tree
---
--- FPGA: Cyclone IV
+-- Modulo: maxpool.vhd (CORREGIDO)
 -- ============================================================
 
 library ieee;
@@ -44,7 +30,7 @@ end entity;
 architecture structural of maxpool is
 
     -- ========================================================
-    -- COMPONENTES BASE
+    -- COMPONENTES BASE (CORREGIDOS)
     -- ========================================================
 
     component ram_sp
@@ -52,9 +38,9 @@ architecture structural of maxpool is
         port (
             clk  : in  std_logic;
             wr   : in  std_logic;
-            addr : in  std_logic_vector(7 downto 0);
-            din  : in  std_logic_vector(7 downto 0);
-            dout : out std_logic_vector(7 downto 0)
+            addr : in  std_logic_vector(ADDR_W-1 downto 0); -- Corregido genérico
+            din  : in  std_logic_vector(DATA_W-1 downto 0); -- Corregido genérico
+            dout : out std_logic_vector(DATA_W-1 downto 0)  -- Corregido genérico
         );
     end component;
 
@@ -66,11 +52,13 @@ architecture structural of maxpool is
             en         : in std_logic;
             valid_in   : in std_logic;
             filt_in    : in std_logic_vector(2 downto 0);
-
+            pool_valid : in std_logic;  -- Agregado puerto faltante
             row_out    : out std_logic_vector(4 downto 0);
             col_out    : out std_logic_vector(4 downto 0);
             even_row   : out std_logic;
             even_col   : out std_logic;
+            last_row   : out std_logic;  -- Agregado puerto faltante
+            last_col   : out std_logic;  -- Agregado puerto faltante
             done       : out std_logic
         );
     end component;
@@ -81,10 +69,8 @@ architecture structural of maxpool is
             reset            : in std_logic;
             en               : in std_logic;
             valid_in         : in std_logic;
-
             even_row         : in std_logic;
             even_col         : in std_logic;
-
             lb_wr            : out std_logic;
             reg_left_cur_en  : out std_logic;
             reg_left_top_en  : out std_logic;
@@ -124,8 +110,8 @@ architecture structural of maxpool is
     signal lb_addr : std_logic_vector(7 downto 0);
     signal lb_dout : std_logic_vector(7 downto 0);
 
-    signal left_cur_d, left_cur_q : std_logic_vector(7 downto 0);
-    signal left_top_d, left_top_q : std_logic_vector(7 downto 0);
+    signal left_cur_q : std_logic_vector(7 downto 0);
+    signal left_top_q : std_logic_vector(7 downto 0);
 
     signal reg_left_cur_en, reg_left_top_en : std_logic;
 
@@ -133,7 +119,6 @@ architecture structural of maxpool is
     signal bot_left, bot_right : signed(7 downto 0);
 
     signal max_val : signed(7 downto 0);
-
     signal pool_valid : std_logic;
 
 begin
@@ -148,19 +133,19 @@ begin
             N_FILT => N_FILT
         )
         port map (
-            clk      => clk,
-            reset    => reset,
-            en       => en,
-            valid_in => valid_in,
-            filt_in  => filt_in,
-
-            row_out  => row_cnt,
-            col_out  => col_cnt,
-
-            even_row => even_row,
-            even_col => even_col,
-
-            done     => done
+            clk        => clk,
+            reset      => reset,
+            en         => en,
+            valid_in   => valid_in,
+            filt_in    => filt_in,
+            pool_valid => pool_valid,  -- Conectado correctamente
+            row_out    => row_cnt,
+            col_out    => col_cnt,
+            even_row   => even_row,
+            even_col   => even_col,
+            last_row   => open,        -- Abierto si no se usa externamente
+            last_col   => open,        -- Abierto si no se usa externamente
+            done       => done
         );
 
     -- ========================================================
@@ -173,10 +158,8 @@ begin
             reset            => reset,
             en               => en,
             valid_in         => valid_in,
-
             even_row         => even_row,
             even_col         => even_col,
-
             lb_wr            => lb_wr,
             reg_left_cur_en  => reg_left_cur_en,
             reg_left_top_en  => reg_left_top_en,
@@ -184,13 +167,13 @@ begin
         );
 
     -- ========================================================
-    -- LINE BUFFER (BRAM)
+    -- LINE BUFFER (BRAM) - ARITMÉTICA ARREGLADA
     -- ========================================================
 
-    lb_addr <= std_logic_vector(
-        resize(unsigned(filt_in), 8) * to_unsigned(IMG_W, 8)
-        + resize(unsigned(col_cnt), 8)
-    );
+    lb_addr <= std_logic_vector(to_unsigned(
+        (to_integer(unsigned(filt_in)) * IMG_W) + to_integer(unsigned(col_cnt)),
+        8
+    ));
 
     U_LB : ram_sp
         generic map (
@@ -210,8 +193,8 @@ begin
     -- REGISTROS DE VENTANA
     -- ========================================================
 
-    -- left_cur
     U_REG_LC : registro
+        generic map (N => 8)
         port map (
             clk   => clk,
             reset => reset,
@@ -220,8 +203,8 @@ begin
             q     => left_cur_q
         );
 
-    -- left_top
     U_REG_LT : registro
+        generic map (N => 8)
         port map (
             clk   => clk,
             reset => reset,
