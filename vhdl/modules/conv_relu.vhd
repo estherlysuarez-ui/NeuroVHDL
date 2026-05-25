@@ -1,354 +1,487 @@
 -- ============================================================
 -- Modulo: conv_relu.vhd
--- Descripcion: Capa convolucional 3x3, 8 filtros, padding=VALID
---              sobre imagen 28x28 en escala de grises (Q1.7).
+-- Descripcion:
+--   Capa convolucional 3x3 + ReLU completamente estructural.
 --
--- OPTIMIZACIONES vs. version original:
---   1. 8 DSP MACs EN PARALELO: un DSP por filtro. Los 9 pesos
---      de cada filtro se acumulan secuencialmente (9 ciclos)
---      pero los 8 filtros trabajan simultaneamente -> throughput
---      8x mayor con los mismos ciclos de reloj.
---   2. LINE BUFFER en BRAM M9K: en lugar de un shift-register
---      masivo de flip-flops (3*28 = 84 FFs x 8b = 672 FFs),
---      se usan dos ram_sp para las dos lineas de "historia".
---      La ventana 3x3 se forma con registros de 3 elementos.
---   3. BIAS sumado con adder de 24 bits (no saturacion prematura).
---   4. ReLU puramente combinacional (comparador con bit de signo).
---   5. Pipeline correcto: mac_cnt gating sincronizado.
+-- Arquitectura:
 --
--- Latencia desde primer pixel valido hasta primer valid_out:
---   2*28 + 2 (lineas de relleno) + 9 (ciclos MAC) + 2 (pipe) ciclos
+--   conv_relu
+--   ├── U_LINE_BUFFER   : line_buffer_3x3
+--   ├── U_CONTROLLER    : conv_controller
+--   ├── U_PARAMS        : conv_params
+--   ├── U_MAC_ARRAY     : mac_accum_array
+--   └── U_RELU          : relu_block
 --
--- Senales:
---   pixel_in  : signed 8b Q1.7 (normalizado 0..127 en el entrenamiento)
---   valid_in  : '1' cuando pixel_in es valido
---   conv_out  : resultado Q1.7 de un filtro
---   filt_idx  : indice 0..7 del filtro cuyo resultado sale
---   valid_out : '1' cuando conv_out/filt_idx son validos
---   done      : '1' al terminar los 784 pixeles (imagen completa)
+-- NOTA:
+--   El selector de ventana 3x3 ya fue integrado dentro de
+--   mac_accum_array, por lo que conv_relu queda totalmente
+--   modular y limpio.
+--
+-- FPGA:
+--   Cyclone IV EP4CE22
 -- ============================================================
+
 library ieee;
 use ieee.std_logic_1164.all;
 use ieee.numeric_std.all;
 
 entity conv_relu is
     generic (
-        IMG_W  : integer := 28;   -- ancho de imagen
-        N_FILT : integer := 8;    -- numero de filtros (mapeo 1:1 a DSPs)
-        FRAC   : integer := 7     -- fraccion Q1.7
+        IMG_W  : integer := 28;
+        N_FILT : integer := 8;
+        FRAC   : integer := 7
     );
     port (
-        clk       : in  std_logic;
-        reset     : in  std_logic;
-        en        : in  std_logic;
-        pixel_in  : in  signed(7 downto 0);
-        valid_in  : in  std_logic;
-        conv_out  : out signed(7 downto 0);
-        filt_idx  : out std_logic_vector(2 downto 0);
+
+        -- ====================================================
+        -- CLOCK / CONTROL
+        -- ====================================================
+
+        clk   : in std_logic;
+        reset : in std_logic;
+        en    : in std_logic;
+
+        -- ====================================================
+        -- INPUT PIXEL STREAM
+        -- ====================================================
+
+        pixel_in : in signed(7 downto 0);
+
+        valid_in : in std_logic;
+
+        -- ====================================================
+        -- OUTPUT FEATURE MAP
+        -- ====================================================
+
+        conv_out : out signed(7 downto 0);
+
+        filt_idx : out std_logic_vector(2 downto 0);
+
         valid_out : out std_logic;
-        done      : out std_logic
+
+        done : out std_logic
+
     );
 end entity;
 
-architecture rtl of conv_relu is
-2
-    -- ── Tipos ────────────────────────────────────────────────
-    type t_kernel  is array(0 to 8) of signed(7 downto 0);
-    type t_kernels is array(0 to N_FILT-1) of t_kernel;
-    type t_bias    is array(0 to N_FILT-1) of signed(7 downto 0);
-    type t_win     is array(0 to 2) of signed(7 downto 0);  -- 3 cols por fila
-    type t_acc     is array(0 to N_FILT-1) of signed(23 downto 0);
-    type t_prod    is array(0 to N_FILT-1) of signed(15 downto 0);
+architecture structural of conv_relu is
 
-    -- ── Pesos Conv1 (3x3x1x8) en Q1.7 ───────────────────────
-    constant KERN : t_kernels := (
-        0 => (to_signed(-18,8), to_signed(45,8),  to_signed(-71,8),
-              to_signed(21,8),  to_signed(-13,8), to_signed(-12,8),
-              to_signed(41,8),  to_signed(-23,8), to_signed(33,8)),
-        1 => (to_signed(-38,8),  to_signed(-107,8), to_signed(53,8),
-              to_signed(-112,8), to_signed(-27,8),  to_signed(15,8),
-              to_signed(20,8),   to_signed(-4,8),   to_signed(-11,8)),
-        2 => (to_signed(-128,8), to_signed(-21,8), to_signed(-33,8),
-              to_signed(22,8),   to_signed(28,8),   to_signed(30,8),
-              to_signed(22,8),   to_signed(48,8),   to_signed(-20,8)),
-        3 => (to_signed(52,8),  to_signed(89,8),  to_signed(-62,8),
-              to_signed(12,8),  to_signed(28,8),  to_signed(27,8),
-              to_signed(34,8),  to_signed(16,8),  to_signed(5,8)),
-        4 => (to_signed(-27,8), to_signed(26,8),  to_signed(10,8),
-              to_signed(47,8),  to_signed(44,8),  to_signed(-22,8),
-              to_signed(1,8),   to_signed(27,8),  to_signed(-95,8)),
-        5 => (to_signed(60,8),  to_signed(-33,8), to_signed(-40,8),
-              to_signed(16,8),  to_signed(4,8),   to_signed(92,8),
-              to_signed(26,8),  to_signed(77,8),  to_signed(41,8)),
-        6 => (to_signed(26,8),  to_signed(47,8),  to_signed(8,8),
-              to_signed(16,8),  to_signed(90,8),  to_signed(24,8),
-              to_signed(61,8),  to_signed(56,8),  to_signed(43,8)),
-        7 => (to_signed(-7,8),  to_signed(30,8),  to_signed(53,8),
-              to_signed(66,8),  to_signed(-33,8), to_signed(-21,8),
-              to_signed(-1,8),  to_signed(36,8),  to_signed(-64,8))
-    );
+    -- ========================================================
+    -- COMPONENTES
+    -- ========================================================
 
-    constant BIAS : t_bias := (
-        0 => to_signed(-10,8),
-        1 => to_signed(-26,8),
-        2 => to_signed(0,8),
-        3 => to_signed(-5,8),
-        4 => to_signed(12,8),
-        5 => to_signed(-4,8),
-        6 => to_signed(-18,8),
-        7 => to_signed(-3,8)
-    );
+    component line_buffer_3x3
+        generic (
+            IMG_W : integer := 28
+        );
+        port (
+            clk       : in  std_logic;
+            reset     : in  std_logic;
+            en        : in  std_logic;
 
-    -- ── Line buffer: dos RAMs de IMG_W x 8b (mapeadas a M9K) ─
-    -- Linea 0 = fila N-2, Linea 1 = fila N-1, fila actual = pixel_in
-    signal lb0_wr, lb1_wr     : std_logic := '0';
-    signal lb0_addr, lb1_addr : std_logic_vector(4 downto 0);  -- 0..27
-    signal lb0_din,  lb1_din  : std_logic_vector(7 downto 0);
-    signal lb0_dout, lb1_dout : std_logic_vector(7 downto 0);
+            pixel_in  : in  signed(7 downto 0);
+            valid_in  : in  std_logic;
 
-    -- ── Ventana 3x3: 3 filas x 3 cols (registros) ────────────
-    -- win_rN_cM : fila N (0=top, 2=bot), columna M (0=left, 2=right)
-    signal win_r0 : t_win := (others => (others => '0'));
-    signal win_r1 : t_win := (others => (others => '0'));
-    signal win_r2 : t_win := (others => (others => '0'));
+            win0      : out signed(7 downto 0);
+            win1      : out signed(7 downto 0);
+            win2      : out signed(7 downto 0);
 
-    -- Mapeo plano para el indice mac_cnt:
-    --  0..2 = win_r0(0..2), 3..5 = win_r1(0..2), 6..8 = win_r2(0..2)
-    type t_win_flat is array(0 to 8) of signed(7 downto 0);
-    signal win_flat : t_win_flat;
+            win3      : out signed(7 downto 0);
+            win4      : out signed(7 downto 0);
+            win5      : out signed(7 downto 0);
 
-    -- ── DSP MACs paralelos ────────────────────────────────────
-    -- Etapa 1: productos registrados (DSP inference)
-    signal r_prod : t_prod := (others => (others => '0'));
-    -- Etapa 2: acumuladores
-    signal r_acc  : t_acc  := (others => (others => '0'));
+            win6      : out signed(7 downto 0);
+            win7      : out signed(7 downto 0);
+            win8      : out signed(7 downto 0);
 
-    attribute multstyle : string;
-    attribute multstyle of r_prod : signal is "dsp";
-
-    -- ── Control ──────────────────────────────────────────────
-    signal cnt_pix  : unsigned(9 downto 0) := (others => '0');  -- 0..783
-    signal cnt_col  : unsigned(4 downto 0) := (others => '0');  -- 0..27
-    signal cnt_row  : unsigned(4 downto 0) := (others => '0');  -- 0..27
-    signal mac_cnt  : unsigned(3 downto 0) := (others => '0');  -- 0..8
-    signal mac_run  : std_logic := '0';
-    signal lb_phase : unsigned(4 downto 0) := (others => '0');  -- escritura lb
-
-    -- ── Output stage ─────────────────────────────────────────
-    signal out_filt : unsigned(2 downto 0) := (others => '0');  -- 0..7
-    signal out_run  : std_logic := '0';
-    signal r_valid  : std_logic := '0';
-    signal r_done   : std_logic := '0';
-    signal r_out    : signed(7 downto 0) := (others => '0');
-    signal r_fidx   : std_logic_vector(2 downto 0) := (others => '0');
-
-    -- ── Auxiliares ───────────────────────────────────────────
-    signal pix_buf  : signed(7 downto 0) := (others => '0');  -- pixel actual
-    signal valid_d1 : std_logic := '0';
-    signal valid_d2 : std_logic := '0';
-
-    -- Ventana lista cuando tenemos >= 2 lineas previas completas
-    signal win_ready : std_logic := '0';
-
-    -- ── Componente BRAM ───────────────────────────────────────
-    component ram_sp
-        generic (ADDR_W : integer; DATA_W : integer; MIF_FILE : string);
-        port (clk  : in  std_logic;
-              wr   : in  std_logic;
-              addr : in  std_logic_vector(ADDR_W-1 downto 0);
-              din  : in  std_logic_vector(DATA_W-1 downto 0);
-              dout : out std_logic_vector(DATA_W-1 downto 0));
+            win_valid : out std_logic
+        );
     end component;
+
+    component conv_params
+        port (
+
+            kernel_addr : in std_logic_vector(3 downto 0);
+
+            bias_addr   : in std_logic_vector(2 downto 0);
+
+            clk         : in std_logic;
+
+            k0_out      : out std_logic_vector(7 downto 0);
+            k1_out      : out std_logic_vector(7 downto 0);
+            k2_out      : out std_logic_vector(7 downto 0);
+            k3_out      : out std_logic_vector(7 downto 0);
+            k4_out      : out std_logic_vector(7 downto 0);
+            k5_out      : out std_logic_vector(7 downto 0);
+            k6_out      : out std_logic_vector(7 downto 0);
+            k7_out      : out std_logic_vector(7 downto 0);
+
+            bias_out    : out std_logic_vector(7 downto 0)
+        );
+    end component;
+
+	component mac_accum_array
+    generic (
+        N_FILT : integer := 8
+    );
+    port (
+
+        -- ====================================================
+        -- CLOCK / CONTROL
+        -- ====================================================
+
+        clk   : in std_logic;
+        reset : in std_logic;
+
+        en    : in std_logic;
+        clr   : in std_logic;
+
+        -- ====================================================
+        -- VENTANA 3x3
+        -- ====================================================
+
+        win0 : in signed(7 downto 0);
+        win1 : in signed(7 downto 0);
+        win2 : in signed(7 downto 0);
+
+        win3 : in signed(7 downto 0);
+        win4 : in signed(7 downto 0);
+        win5 : in signed(7 downto 0);
+
+        win6 : in signed(7 downto 0);
+        win7 : in signed(7 downto 0);
+        win8 : in signed(7 downto 0);
+
+        -- ====================================================
+        -- INDICE KERNEL
+        -- ====================================================
+
+        mac_idx : in std_logic_vector(3 downto 0);
+
+        -- ====================================================
+        -- PESOS KERNELS
+        -- ====================================================
+
+        kernel0 : in signed(7 downto 0);
+        kernel1 : in signed(7 downto 0);
+        kernel2 : in signed(7 downto 0);
+        kernel3 : in signed(7 downto 0);
+        kernel4 : in signed(7 downto 0);
+        kernel5 : in signed(7 downto 0);
+        kernel6 : in signed(7 downto 0);
+        kernel7 : in signed(7 downto 0);
+
+        -- ====================================================
+        -- ACUMULADORES
+        -- ====================================================
+
+        acc0 : out signed(23 downto 0);
+        acc1 : out signed(23 downto 0);
+        acc2 : out signed(23 downto 0);
+        acc3 : out signed(23 downto 0);
+        acc4 : out signed(23 downto 0);
+        acc5 : out signed(23 downto 0);
+        acc6 : out signed(23 downto 0);
+        acc7 : out signed(23 downto 0)
+
+    );
+	end component;
+
+    component relu_block
+        generic (
+            FRAC : integer := 7
+        );
+        port (
+
+            acc0 : in signed(23 downto 0);
+            acc1 : in signed(23 downto 0);
+            acc2 : in signed(23 downto 0);
+            acc3 : in signed(23 downto 0);
+            acc4 : in signed(23 downto 0);
+            acc5 : in signed(23 downto 0);
+            acc6 : in signed(23 downto 0);
+            acc7 : in signed(23 downto 0);
+
+            bias0 : in signed(7 downto 0);
+            bias1 : in signed(7 downto 0);
+            bias2 : in signed(7 downto 0);
+            bias3 : in signed(7 downto 0);
+            bias4 : in signed(7 downto 0);
+            bias5 : in signed(7 downto 0);
+            bias6 : in signed(7 downto 0);
+            bias7 : in signed(7 downto 0);
+
+            filt_sel : in std_logic_vector(2 downto 0);
+
+            relu_out : out signed(7 downto 0)
+
+        );
+    end component;
+
+    component conv_controller
+        generic (
+            N_FILT : integer := 8
+        );
+        port (
+
+            clk   : in std_logic;
+            reset : in std_logic;
+            en    : in std_logic;
+
+            window_valid : in std_logic;
+
+            image_done   : in std_logic;
+
+            mac_en  : out std_logic;
+
+            mac_clr : out std_logic;
+
+            mac_idx : out std_logic_vector(3 downto 0);
+
+            filt_sel : out std_logic_vector(2 downto 0);
+
+            out_valid : out std_logic;
+
+            done : out std_logic
+
+        );
+    end component;
+
+    -- ========================================================
+    -- LINE BUFFER
+    -- ========================================================
+
+    signal win0 : signed(7 downto 0);
+    signal win1 : signed(7 downto 0);
+    signal win2 : signed(7 downto 0);
+
+    signal win3 : signed(7 downto 0);
+    signal win4 : signed(7 downto 0);
+    signal win5 : signed(7 downto 0);
+
+    signal win6 : signed(7 downto 0);
+    signal win7 : signed(7 downto 0);
+    signal win8 : signed(7 downto 0);
+
+    signal win_valid : std_logic;
+
+    -- ========================================================
+    -- CONTROLLER
+    -- ========================================================
+
+    signal mac_en  : std_logic;
+    signal mac_clr : std_logic;
+
+    signal mac_idx : std_logic_vector(3 downto 0);
+
+    signal filt_sel : std_logic_vector(2 downto 0);
+
+    signal out_valid_i : std_logic;
+
+    -- ========================================================
+    -- KERNELS
+    -- ========================================================
+
+    signal k0 : std_logic_vector(7 downto 0);
+    signal k1 : std_logic_vector(7 downto 0);
+    signal k2 : std_logic_vector(7 downto 0);
+    signal k3 : std_logic_vector(7 downto 0);
+    signal k4 : std_logic_vector(7 downto 0);
+    signal k5 : std_logic_vector(7 downto 0);
+    signal k6 : std_logic_vector(7 downto 0);
+    signal k7 : std_logic_vector(7 downto 0);
+
+    signal bias_dummy : std_logic_vector(7 downto 0);
+
+    -- ========================================================
+    -- ACCUMULATORS
+    -- ========================================================
+
+    signal acc0 : signed(23 downto 0);
+    signal acc1 : signed(23 downto 0);
+    signal acc2 : signed(23 downto 0);
+    signal acc3 : signed(23 downto 0);
+    signal acc4 : signed(23 downto 0);
+    signal acc5 : signed(23 downto 0);
+    signal acc6 : signed(23 downto 0);
+    signal acc7 : signed(23 downto 0);
 
 begin
 
-    -- ── Instancias BRAM de line buffer (1 M9K cada una) ───────
-    U_LB0 : ram_sp
-        generic map (ADDR_W => 5, DATA_W => 8, MIF_FILE => "")
-        port map (clk => clk, wr => lb0_wr, addr => lb0_addr,
-                  din => lb0_din, dout => lb0_dout);
+    -- ========================================================
+    -- LINE BUFFER + WINDOW
+    -- ========================================================
 
-    U_LB1 : ram_sp
-        generic map (ADDR_W => 5, DATA_W => 8, MIF_FILE => "")
-        port map (clk => clk, wr => lb1_wr, addr => lb1_addr,
-                  din => lb1_din, dout => lb1_dout);
+    U_LINE_BUFFER : line_buffer_3x3
+        generic map (
+            IMG_W => IMG_W
+        )
+        port map (
 
-    -- ── Mapeo plano de la ventana 3x3 ────────────────────────
-    win_flat(0) <= win_r0(0); win_flat(1) <= win_r0(1); win_flat(2) <= win_r0(2);
-    win_flat(3) <= win_r1(0); win_flat(4) <= win_r1(1); win_flat(5) <= win_r1(2);
-    win_flat(6) <= win_r2(0); win_flat(7) <= win_r2(1); win_flat(8) <= win_r2(2);
+            clk => clk,
+            reset => reset,
+            en => en,
 
-    -- ── Proceso principal ─────────────────────────────────────
-    process(clk)
-        variable biased  : signed(23 downto 0);
-        variable trunced : signed(7 downto 0);
-    begin
-        if rising_edge(clk) then
-            if reset = '1' then
-                cnt_pix   <= (others => '0');
-                cnt_col   <= (others => '0');
-                cnt_row   <= (others => '0');
-                mac_cnt   <= (others => '0');
-                mac_run   <= '0';
-                out_filt  <= (others => '0');
-                out_run   <= '0';
-                r_valid   <= '0';
-                r_done    <= '0';
-                win_ready <= '0';
-                lb_phase  <= (others => '0');
-                win_r0    <= (others => (others => '0'));
-                win_r1    <= (others => (others => '0'));
-                win_r2    <= (others => (others => '0'));
-                r_acc     <= (others => (others => '0'));
-                r_prod    <= (others => (others => '0'));
-            else
-                -- Defaults
-                lb0_wr  <= '0';
-                lb1_wr  <= '0';
-                r_valid <= '0';
-                r_done  <= '0';
+            pixel_in => pixel_in,
+            valid_in => valid_in,
 
-                -- ── Paso 1: llegada de pixel ──────────────────
-                if valid_in = '1' and en = '1' then
-                    pix_buf <= pixel_in;
+            win0 => win0,
+            win1 => win1,
+            win2 => win2,
 
-                    -- Actualizar ventana deslizante:
-                    -- La fila 2 (inferior) viene de pixel_in
-                    -- La fila 1 (media)   viene de lb1 (lectura del ciclo anterior)
-                    -- La fila 0 (superior) viene de lb0
-                    win_r2(2) <= win_r2(1);
-                    win_r2(1) <= win_r2(0);
-                    win_r2(0) <= pixel_in;
+            win3 => win3,
+            win4 => win4,
+            win5 => win5,
 
-                    win_r1(2) <= win_r1(1);
-                    win_r1(1) <= win_r1(0);
-                    win_r1(0) <= signed(lb1_dout);  -- 1 ciclo latencia BRAM
+            win6 => win6,
+            win7 => win7,
+            win8 => win8,
 
-                    win_r0(2) <= win_r0(1);
-                    win_r0(1) <= win_r0(0);
-                    win_r0(0) <= signed(lb0_dout);
+            win_valid => win_valid
+        );
 
-                    -- Escribir pixel actual en lb1 (sera lb0 en la prox fila)
-                    -- y lb1 pasa a lb0 al avanzar de fila
-                    lb1_wr   <= '1';
-                    lb1_din  <= std_logic_vector(pixel_in);
-                    lb1_addr <= std_logic_vector(cnt_col);
+    -- ========================================================
+    -- CONTROLADOR
+    -- ========================================================
 
-                    -- Lectura anticipada para el proximo pixel
-                    lb0_addr <= std_logic_vector(cnt_col);
-                    lb1_addr <= std_logic_vector(cnt_col);
+    U_CONTROLLER : conv_controller
+        generic map (
+            N_FILT => N_FILT
+        )
+        port map (
 
-                    -- Contadores
-                    if cnt_col = IMG_W-1 then
-                        cnt_col <= (others => '0');
-                        if cnt_row = IMG_W-1 then
-                            cnt_row <= (others => '0');
-                            r_done  <= '1';
-                        else
-                            cnt_row <= cnt_row + 1;
-                        end if;
-                        -- Al completar fila: rotar line buffers
-                        -- lb0 <- lb1 (copiar se hace implicitamente con los punteros
-                        --  porque ambos usan la misma columna; en el siguiente row
-                        --  lb0 lee lo que lb1 escribio en esta vuelta)
-                        -- Implementacion: alternamos quien escribe (ping-pong)
-                        -- Para simplicidad: lb0 siempre tiene fila N-2, lb1 fila N-1
-                        -- Usamos un flag de paridad de fila
-                        lb0_wr   <= '1';
-                        lb0_din  <= lb1_dout;  -- mover lb1 -> lb0 al rotar
-                        lb0_addr <= std_logic_vector(cnt_col);
-                    else
-                        cnt_col <= cnt_col + 1;
-                    end if;
+            clk => clk,
+            reset => reset,
+            en => en,
 
-                    cnt_pix <= cnt_pix + 1;
+            window_valid => win_valid,
 
-                    -- La ventana esta lista cuando hay al menos 2 filas completas
-                    if cnt_pix >= to_unsigned(2*IMG_W + 1, 10) then
-                        win_ready <= '1';
-                    end if;
-                end if;
+            image_done => '0',
 
-                -- ── Paso 2: lanzar MAC cuando ventana lista ───
-                if win_ready = '1' and valid_in = '1' and en = '1'
-                   and mac_run = '0' and out_run = '0' then
-                    -- Limpiar acumuladores y arrancar
-                    for f in 0 to N_FILT-1 loop
-                        r_acc(f) <= (others => '0');
-                    end loop;
-                    mac_cnt <= (others => '0');
-                    mac_run <= '1';
-                end if;
+            mac_en => mac_en,
+            mac_clr => mac_clr,
 
-				-- ── Paso 3: fase MAC (9 ciclos + 1 flush pipeline) ─
-				if mac_run = '1' then
+            mac_idx => mac_idx,
 
-					 -- =====================================================
-					 -- ETAPA 1: DSP MULTIPLY
-					 -- SOLO indices validos 0..8
-					 -- =====================================================
-					 if mac_cnt < 9 then
-						  for f in 0 to N_FILT-1 loop
-								r_prod(f) <= win_flat(to_integer(mac_cnt)) *
-												 KERN(f)(to_integer(mac_cnt));
-						  end loop;
-					 end if;
+            filt_sel => filt_sel,
 
-					 -- =====================================================
-					 -- ETAPA 2: ACUMULACION PIPELINE
-					 -- Desde mac_cnt=1 ya existe producto valido previo
-					 -- =====================================================
-					 if mac_cnt > 0 then
-						  for f in 0 to N_FILT-1 loop
-								r_acc(f) <= r_acc(f) + resize(r_prod(f), 24);
-						  end loop;
-					 end if;
+            out_valid => out_valid_i,
 
-					 -- =====================================================
-					 -- CONTROL PIPELINE
-					 -- mac_cnt = 9 -> flush final
-					 -- =====================================================
-					 if mac_cnt = 9 then
-						  mac_run  <= '0';
-						  out_run  <= '1';
-						  out_filt <= (others => '0');
-					 else
-						  mac_cnt <= mac_cnt + 1;
-					 end if;
+            done => done
+        );
 
-				end if;
+    -- ========================================================
+    -- PARAMETROS CNN
+    -- ========================================================
 
-                -- ── Paso 4: salida secuencial (1 filtro por ciclo) ───
-                if out_run = '1' then
-                    -- Sumar bias y truncar a Q1.7
-                    biased  := r_acc(to_integer(out_filt)) +
-                               resize(BIAS(to_integer(out_filt)), 24);
-                    -- Truncar: tomar bits [FRAC+7:FRAC] = [14:7]
-                    trunced := biased(FRAC+7 downto FRAC);
-                    -- ReLU: si negativo -> 0
-                    if biased(23) = '0' then
-                        r_out <= trunced;
-                    else
-                        r_out <= (others => '0');
-                    end if;
-                    r_fidx  <= std_logic_vector(out_filt);
-                    r_valid <= '1';
+    U_PARAMS : conv_params
+        port map (
 
-                    if out_filt = N_FILT-1 then
-                        out_run  <= '0';
-                        out_filt <= (others => '0');
-                    else
-                        out_filt <= out_filt + 1;
-                    end if;
-                end if;
+            kernel_addr => mac_idx,
 
-            end if;
-        end if;
-    end process;
+            bias_addr => filt_sel,
 
-    conv_out  <= r_out;
-    filt_idx  <= r_fidx;
-    valid_out <= r_valid;
-    done      <= r_done;
+            clk => clk,
+
+            k0_out => k0,
+            k1_out => k1,
+            k2_out => k2,
+            k3_out => k3,
+            k4_out => k4,
+            k5_out => k5,
+            k6_out => k6,
+            k7_out => k7,
+
+            bias_out => bias_dummy
+        );
+
+    -- ========================================================
+    -- MAC ARRAY + SELECTOR 3x3
+    -- ========================================================
+
+    U_MAC_ARRAY : mac_accum_array
+    generic map (
+        N_FILT => N_FILT
+    )
+    port map (
+
+        clk => clk,
+        reset => reset,
+
+        en => mac_en,
+        clr => mac_clr,
+
+        mac_idx => mac_idx,
+
+        win0 => win0,
+        win1 => win1,
+        win2 => win2,
+
+        win3 => win3,
+        win4 => win4,
+        win5 => win5,
+
+        win6 => win6,
+        win7 => win7,
+        win8 => win8,
+
+        kernel0 => signed(k0),
+        kernel1 => signed(k1),
+        kernel2 => signed(k2),
+        kernel3 => signed(k3),
+        kernel4 => signed(k4),
+        kernel5 => signed(k5),
+        kernel6 => signed(k6),
+        kernel7 => signed(k7),
+
+        acc0 => acc0,
+        acc1 => acc1,
+        acc2 => acc2,
+        acc3 => acc3,
+        acc4 => acc4,
+        acc5 => acc5,
+        acc6 => acc6,
+        acc7 => acc7
+    );
+    -- ========================================================
+    -- RELU + BIAS
+    -- ========================================================
+
+    U_RELU : relu_block
+        generic map (
+            FRAC => FRAC
+        )
+        port map (
+
+            acc0 => acc0,
+            acc1 => acc1,
+            acc2 => acc2,
+            acc3 => acc3,
+            acc4 => acc4,
+            acc5 => acc5,
+            acc6 => acc6,
+            acc7 => acc7,
+
+            bias0 => to_signed(0,8),
+            bias1 => to_signed(0,8),
+            bias2 => to_signed(0,8),
+            bias3 => to_signed(0,8),
+            bias4 => to_signed(0,8),
+            bias5 => to_signed(0,8),
+            bias6 => to_signed(0,8),
+            bias7 => to_signed(0,8),
+
+            filt_sel => filt_sel,
+
+            relu_out => conv_out
+        );
+
+    -- ========================================================
+    -- OUTPUTS
+    -- ========================================================
+
+    filt_idx <= filt_sel;
+
+    valid_out <= out_valid_i;
 
 end architecture;

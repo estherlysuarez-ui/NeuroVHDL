@@ -1,41 +1,39 @@
 -- ============================================================
--- Modulo: maxpool.vhd
--- Descripcion: MaxPooling 2x2 con stride 2.
---              Entrada: 28x28x8 canales -> Salida: 14x14x8
+-- Modulo: maxpool.vhd (REFACTORIZADO)
+-- Descripcion:
+--   MaxPooling 2x2 completamente estructural.
+--   No contiene lógica de control ni contadores internos.
 --
--- OPTIMIZACIONES vs. version original:
---   1. Buffer de una fila completa por filtro (8 x 28 x 8b = 1792b)
---      mapeado a BRAM M9K en lugar de arreglo 2D de FFs.
---   2. Logica de ventana 2x2 correcta:
---        - Fila par  (row par):  guardar pixel en line buffer
---        - Fila impar(row impar): comparar con fila anterior
---        - Columna par  : guardar pixel izquierdo
---        - Columna impar: calcular max(top-left, top-right,
---                                     bot-left, bot-right)
---   3. Señal done al terminar imagen completa.
---   4. filt_in/filt_out correctamente propagados.
+-- Arquitectura:
 --
--- Protocolo:
---   data_in / filt_in / valid_in : pixel de un canal de conv_relu
---   pool_out / filt_out / valid_out : pixel pooled
---   done : '1' al terminar la imagen 14x14
+--   maxpool
+--   ├── maxpool_counters
+--   ├── maxpool_controller
+--   ├── line buffer (ram_sp)
+--   ├── registros (left_cur, left_top)
+--   └── max_tree
+--
+-- FPGA: Cyclone IV
 -- ============================================================
+
 library ieee;
 use ieee.std_logic_1164.all;
 use ieee.numeric_std.all;
 
 entity maxpool is
     generic (
-        IMG_W  : integer := 28;   -- ancho de imagen entrada
-        N_FILT : integer := 8     -- numero de canales/filtros
+        IMG_W  : integer := 28;
+        N_FILT : integer := 8
     );
     port (
         clk       : in  std_logic;
         reset     : in  std_logic;
         en        : in  std_logic;
+
         data_in   : in  signed(7 downto 0);
         filt_in   : in  std_logic_vector(2 downto 0);
         valid_in  : in  std_logic;
+
         pool_out  : out signed(7 downto 0);
         filt_out  : out std_logic_vector(2 downto 0);
         valid_out : out std_logic;
@@ -43,159 +41,219 @@ entity maxpool is
     );
 end entity;
 
-architecture rtl of maxpool is
+architecture structural of maxpool is
 
-    -- Line buffer: guarda una fila entera para cada filtro.
-    -- Organizacion: addr = filtro * IMG_W + columna
-    -- Tamaño: 8 * 28 = 224 x 8b = 1792 bits -> cabe en 1 M9K
+    -- ========================================================
+    -- COMPONENTES BASE
+    -- ========================================================
+
     component ram_sp
         generic (ADDR_W : integer; DATA_W : integer; MIF_FILE : string);
-        port (clk  : in  std_logic;
-              wr   : in  std_logic;
-              addr : in  std_logic_vector(ADDR_W-1 downto 0);
-              din  : in  std_logic_vector(DATA_W-1 downto 0);
-              dout : out std_logic_vector(DATA_W-1 downto 0));
+        port (
+            clk  : in  std_logic;
+            wr   : in  std_logic;
+            addr : in  std_logic_vector(7 downto 0);
+            din  : in  std_logic_vector(7 downto 0);
+            dout : out std_logic_vector(7 downto 0)
+        );
     end component;
 
-    -- Dirección: 8 bits (log2(8*28) = log2(224) <= 8)
-    signal lb_wr   : std_logic := '0';
+    component maxpool_counters
+        generic (IMG_W : integer; N_FILT : integer);
+        port (
+            clk        : in std_logic;
+            reset      : in std_logic;
+            en         : in std_logic;
+            valid_in   : in std_logic;
+            filt_in    : in std_logic_vector(2 downto 0);
+
+            row_out    : out std_logic_vector(4 downto 0);
+            col_out    : out std_logic_vector(4 downto 0);
+            even_row   : out std_logic;
+            even_col   : out std_logic;
+            done       : out std_logic
+        );
+    end component;
+
+    component maxpool_controller
+        port (
+            clk              : in std_logic;
+            reset            : in std_logic;
+            en               : in std_logic;
+            valid_in         : in std_logic;
+
+            even_row         : in std_logic;
+            even_col         : in std_logic;
+
+            lb_wr            : out std_logic;
+            reg_left_cur_en  : out std_logic;
+            reg_left_top_en  : out std_logic;
+            pool_valid       : out std_logic
+        );
+    end component;
+
+    component max_tree
+        port (
+            top_left  : in signed(7 downto 0);
+            top_right : in signed(7 downto 0);
+            bot_left  : in signed(7 downto 0);
+            bot_right : in signed(7 downto 0);
+            max_out   : out signed(7 downto 0)
+        );
+    end component;
+
+    component registro
+        generic (N : integer := 8);
+        port (
+            clk   : in std_logic;
+            reset : in std_logic;
+            en    : in std_logic;
+            d     : in std_logic_vector(N-1 downto 0);
+            q     : out std_logic_vector(N-1 downto 0)
+        );
+    end component;
+
+    -- ========================================================
+    -- SEÑALES INTERNAS
+    -- ========================================================
+
+    signal row_cnt, col_cnt : std_logic_vector(4 downto 0);
+    signal even_row, even_col : std_logic;
+
+    signal lb_wr : std_logic;
     signal lb_addr : std_logic_vector(7 downto 0);
-    signal lb_din  : std_logic_vector(7 downto 0);
     signal lb_dout : std_logic_vector(7 downto 0);
 
-    -- Contadores de posicion
-    signal col : unsigned(4 downto 0) := (others => '0');  -- 0..27
-    signal row : unsigned(4 downto 0) := (others => '0');  -- 0..27
+    signal left_cur_d, left_cur_q : std_logic_vector(7 downto 0);
+    signal left_top_d, left_top_q : std_logic_vector(7 downto 0);
 
-    -- Registro del pixel izquierdo (columna par de la fila actual)
-    signal left_cur  : signed(7 downto 0) := (others => '0');  -- bot-left
-    signal left_top  : signed(7 downto 0) := (others => '0');  -- top-left (del lb)
+    signal reg_left_cur_en, reg_left_top_en : std_logic;
 
-    -- Salidas registradas
-    signal r_out   : signed(7 downto 0) := (others => '0');
-    signal r_filt  : std_logic_vector(2 downto 0) := (others => '0');
-    signal r_valid : std_logic := '0';
-    signal r_done  : std_logic := '0';
+    signal top_left, top_right : signed(7 downto 0);
+    signal bot_left, bot_right : signed(7 downto 0);
 
-    -- Contador de pixeles de salida
-    signal out_cnt : unsigned(10 downto 0) := (others => '0');  -- 0..14*14*8-1
+    signal max_val : signed(7 downto 0);
 
-    -- Funcion max de dos signed
-    function max2(a, b : signed(7 downto 0)) return signed is
-    begin
-        if a > b then return a; else return b; end if;
-    end function;
+    signal pool_valid : std_logic;
 
 begin
 
-    -- BRAM para line buffer (1 M9K)
-    U_LB : ram_sp
-        generic map (ADDR_W => 8, DATA_W => 8, MIF_FILE => "")
-        port map (clk  => clk,
-                  wr   => lb_wr,
-                  addr => lb_addr,
-                  din  => lb_din,
-                  dout => lb_dout);
+    -- ========================================================
+    -- COUNTERS
+    -- ========================================================
 
-    -- FIX: calculo de direccion.
-    -- Se opera en 9 bits para evitar overflow intermedio (max = 7*28+27 = 223),
-    -- luego resize a 8 bits (223 < 256, sin perdida). Esto es valido en VHDL-93
-    -- porque std_logic_vector se aplica sobre el resultado final de resize,
-    -- no sobre una expresion de conversion de tipo.
+    U_COUNTERS : maxpool_counters
+        generic map (
+            IMG_W  => IMG_W,
+            N_FILT => N_FILT
+        )
+        port map (
+            clk      => clk,
+            reset    => reset,
+            en       => en,
+            valid_in => valid_in,
+            filt_in  => filt_in,
+
+            row_out  => row_cnt,
+            col_out  => col_cnt,
+
+            even_row => even_row,
+            even_col => even_col,
+
+            done     => done
+        );
+
+    -- ========================================================
+    -- CONTROLLER
+    -- ========================================================
+
+    U_CTRL : maxpool_controller
+        port map (
+            clk              => clk,
+            reset            => reset,
+            en               => en,
+            valid_in         => valid_in,
+
+            even_row         => even_row,
+            even_col         => even_col,
+
+            lb_wr            => lb_wr,
+            reg_left_cur_en  => reg_left_cur_en,
+            reg_left_top_en  => reg_left_top_en,
+            pool_valid       => pool_valid
+        );
+
+    -- ========================================================
+    -- LINE BUFFER (BRAM)
+    -- ========================================================
+
     lb_addr <= std_logic_vector(
-                  resize(
-                    resize(unsigned(filt_in), 9) * to_unsigned(IMG_W, 9)
-                    + resize(col, 9),
-                  8));
+        resize(unsigned(filt_in), 8) * to_unsigned(IMG_W, 8)
+        + resize(unsigned(col_cnt), 8)
+    );
 
-    process(clk)
-        variable top_left  : signed(7 downto 0);
-        variable top_right : signed(7 downto 0);
-        variable bot_left  : signed(7 downto 0);
-        variable bot_right : signed(7 downto 0);
-        variable best      : signed(7 downto 0);
-    begin
-        if rising_edge(clk) then
-            if reset = '1' then
-                col     <= (others => '0');
-                row     <= (others => '0');
-                lb_wr   <= '0';
-                r_valid <= '0';
-                r_done  <= '0';
-                out_cnt <= (others => '0');
-                left_cur <= (others => '0');
-                left_top <= (others => '0');
-            else
-                lb_wr   <= '0';
-                r_valid <= '0';
-                r_done  <= '0';
+    U_LB : ram_sp
+        generic map (
+            ADDR_W => 8,
+            DATA_W => 8,
+            MIF_FILE => ""
+        )
+        port map (
+            clk  => clk,
+            wr   => lb_wr,
+            addr => lb_addr,
+            din  => std_logic_vector(data_in),
+            dout => lb_dout
+        );
 
-                if valid_in = '1' and en = '1' then
+    -- ========================================================
+    -- REGISTROS DE VENTANA
+    -- ========================================================
 
-                    if row(0) = '0' then
-                        -- ── Fila par: guardar en line buffer ─────────────
-                        lb_wr  <= '1';
-                        lb_din <= std_logic_vector(data_in);
-                        -- Guardar pixel izquierdo cuando col es par
-                        if col(0) = '0' then
-                            left_cur <= data_in;
-                        end if;
+    -- left_cur
+    U_REG_LC : registro
+        port map (
+            clk   => clk,
+            reset => reset,
+            en    => reg_left_cur_en,
+            d     => std_logic_vector(data_in),
+            q     => left_cur_q
+        );
 
-                    else
-                        -- ── Fila impar ────────────────────────────────────
-                        if col(0) = '0' then
-                            -- Columna par: guardar bot-left y leer top-left
-                            left_cur <= data_in;
-                            left_top <= signed(lb_dout);  -- top-left del LB
-                        else
-                            -- Columna impar: tenemos la ventana 2x2 completa
-                            -- top-left = left_top (guardado ciclo anterior)
-                            -- top-right = lb_dout (lectura actual BRAM, col impar)
-                            -- bot-left = left_cur
-                            -- bot-right = data_in
-                            top_left  := left_top;
-                            top_right := signed(lb_dout);
-                            bot_left  := left_cur;
-                            bot_right := data_in;
+    -- left_top
+    U_REG_LT : registro
+        port map (
+            clk   => clk,
+            reset => reset,
+            en    => reg_left_top_en,
+            d     => lb_dout,
+            q     => left_top_q
+        );
 
-                            best := max2(max2(top_left, top_right),
-                                        max2(bot_left, bot_right));
+    -- ========================================================
+    -- MAX TREE (2x2 pooling)
+    -- ========================================================
 
-                            r_out   <= best;
-                            r_filt  <= filt_in;
-                            r_valid <= '1';
+    top_left  <= signed(left_top_q);
+    top_right <= signed(lb_dout);
+    bot_left  <= signed(left_cur_q);
+    bot_right <= data_in;
 
-                            out_cnt <= out_cnt + 1;
-                            -- Done cuando completamos 14*14*8 = 1568 pixeles
-                            if out_cnt = (IMG_W/2)*(IMG_W/2)*N_FILT - 1 then
-                                r_done  <= '1';
-                                out_cnt <= (others => '0');
-                            end if;
-                        end if;
-                    end if;
+    U_MAX : max_tree
+        port map (
+            top_left  => top_left,
+            top_right => top_right,
+            bot_left  => bot_left,
+            bot_right => bot_right,
+            max_out   => max_val
+        );
 
-                    -- Avanzar contadores (por cada canal)
-                    if unsigned(filt_in) = N_FILT-1 then
-                        if col = IMG_W-1 then
-                            col <= (others => '0');
-                            if row = IMG_W-1 then
-                                row <= (others => '0');
-                            else
-                                row <= row + 1;
-                            end if;
-                        else
-                            col <= col + 1;
-                        end if;
-                    end if;
+    -- ========================================================
+    -- SALIDAS
+    -- ========================================================
 
-                end if;
-            end if;
-        end if;
-    end process;
+    pool_out  <= max_val;
+    filt_out  <= filt_in;
+    valid_out <= pool_valid;
 
-    pool_out  <= r_out;
-    filt_out  <= r_filt;
-    valid_out <= r_valid;
-    done      <= r_done;
-
-end architecture rtl;
+end architecture;

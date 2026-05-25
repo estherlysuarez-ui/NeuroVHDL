@@ -1,0 +1,15 @@
+DEPTH = 9;
+WIDTH = 8;
+ADDRESS_RADIX = UNS;
+DATA_RADIX = HEX;
+CONTENT BEGIN
+  0 : 9F;
+  1 : A0;
+  2 : 0C;
+  3 : A5;
+  4 : 15;
+  5 : 2D;
+  6 : 34;
+  7 : 71;
+  8 : 3A;
+END;

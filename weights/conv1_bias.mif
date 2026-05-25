@@ -1,0 +1,14 @@
+DEPTH = 8;
+WIDTH = 8;
+ADDRESS_RADIX = UNS;
+DATA_RADIX = HEX;
+CONTENT BEGIN
+  0 : 00;
+  1 : F9;
+  2 : 03;
+  3 : F7;
+  4 : F2;
+  5 : F2;
+  6 : E7;
+  7 : 22;
+END;
