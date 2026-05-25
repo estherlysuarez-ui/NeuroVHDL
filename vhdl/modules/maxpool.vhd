@@ -97,10 +97,16 @@ begin
                   din  => lb_din,
                   dout => lb_dout);
 
-    -- Dirección BRAM: filt * IMG_W + col
+    -- FIX: calculo de direccion.
+    -- Se opera en 9 bits para evitar overflow intermedio (max = 7*28+27 = 223),
+    -- luego resize a 8 bits (223 < 256, sin perdida). Esto es valido en VHDL-93
+    -- porque std_logic_vector se aplica sobre el resultado final de resize,
+    -- no sobre una expresion de conversion de tipo.
     lb_addr <= std_logic_vector(
-                  resize(unsigned(filt_in), 5) * to_unsigned(IMG_W, 5)
-                  + col)(7 downto 0);
+                  resize(
+                    resize(unsigned(filt_in), 9) * to_unsigned(IMG_W, 9)
+                    + resize(col, 9),
+                  8));
 
     process(clk)
         variable top_left  : signed(7 downto 0);

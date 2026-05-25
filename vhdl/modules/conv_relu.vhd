@@ -51,7 +51,7 @@ entity conv_relu is
 end entity;
 
 architecture rtl of conv_relu is
-
+2
     -- ── Tipos ────────────────────────────────────────────────
     type t_kernel  is array(0 to 8) of signed(7 downto 0);
     type t_kernels is array(0 to N_FILT-1) of t_kernel;
@@ -280,33 +280,43 @@ begin
                     mac_run <= '1';
                 end if;
 
-                -- ── Paso 3: fase MAC (9 ciclos, 8 DSPs en paralelo) ─
-                if mac_run = '1' then
-                    -- Etapa 1 DSP: calcular productos (todos los filtros en paralelo)
-                    for f in 0 to N_FILT-1 loop
-                        r_prod(f) <= win_flat(to_integer(mac_cnt)) *
-                                     KERN(f)(to_integer(mac_cnt));
-                    end loop;
+				-- ── Paso 3: fase MAC (9 ciclos + 1 flush pipeline) ─
+				if mac_run = '1' then
 
-                    -- Etapa 2: acumular productos del ciclo anterior (pipeline 1 ciclo)
-                    if mac_cnt > 0 then
-                        for f in 0 to N_FILT-1 loop
-                            r_acc(f) <= r_acc(f) + resize(r_prod(f), 24);
-                        end loop;
-                    end if;
+					 -- =====================================================
+					 -- ETAPA 1: DSP MULTIPLY
+					 -- SOLO indices validos 0..8
+					 -- =====================================================
+					 if mac_cnt < 9 then
+						  for f in 0 to N_FILT-1 loop
+								r_prod(f) <= win_flat(to_integer(mac_cnt)) *
+												 KERN(f)(to_integer(mac_cnt));
+						  end loop;
+					 end if;
 
-                    if mac_cnt = 9 then  -- 9 = ultimo ciclo de flush del pipeline
-                        mac_run  <= '0';
-                        out_run  <= '1';
-                        out_filt <= (others => '0');
-                        -- Sumar ultimo producto
-                        for f in 0 to N_FILT-1 loop
-                            r_acc(f) <= r_acc(f) + resize(r_prod(f), 24);
-                        end loop;
-                    else
-                        mac_cnt <= mac_cnt + 1;
-                    end if;
-                end if;
+					 -- =====================================================
+					 -- ETAPA 2: ACUMULACION PIPELINE
+					 -- Desde mac_cnt=1 ya existe producto valido previo
+					 -- =====================================================
+					 if mac_cnt > 0 then
+						  for f in 0 to N_FILT-1 loop
+								r_acc(f) <= r_acc(f) + resize(r_prod(f), 24);
+						  end loop;
+					 end if;
+
+					 -- =====================================================
+					 -- CONTROL PIPELINE
+					 -- mac_cnt = 9 -> flush final
+					 -- =====================================================
+					 if mac_cnt = 9 then
+						  mac_run  <= '0';
+						  out_run  <= '1';
+						  out_filt <= (others => '0');
+					 else
+						  mac_cnt <= mac_cnt + 1;
+					 end if;
+
+				end if;
 
                 -- ── Paso 4: salida secuencial (1 filtro por ciclo) ───
                 if out_run = '1' then
