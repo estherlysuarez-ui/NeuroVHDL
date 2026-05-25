@@ -48,6 +48,8 @@ entity conv_relu is
         pixel_in : in signed(7 downto 0);
 
         valid_in : in std_logic;
+		  
+		  image_done : in std_logic;
 
         -- ====================================================
         -- OUTPUT FEATURE MAP
@@ -356,7 +358,7 @@ begin
 
             window_valid => win_valid,
 
-            image_done => '0',
+            image_done => image_done,
 
             mac_en => mac_en,
             mac_clr => mac_clr,

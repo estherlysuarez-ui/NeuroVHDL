@@ -145,6 +145,8 @@ architecture structural of main is
             pixel_in : in signed(7 downto 0);
 
             valid_in : in std_logic;
+				
+				image_done : in std_logic;
 
             conv_out : out signed(7 downto 0);
 
@@ -372,6 +374,8 @@ begin
             pixel_in => pixel_out,
 
             valid_in => pixel_valid,
+				
+				image_done => done_entrada,
 
             conv_out => conv_out,
 
