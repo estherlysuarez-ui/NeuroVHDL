@@ -1,5 +1,5 @@
 -- ============================================================
--- Modulo: fc2_controllers.vhd (SALIDAS REGISTRADAS ANTI-LAZOS)
+-- Modulo: fc2_controllers.vhd (CORRECCIÓN DE PERSISTENCIA)
 -- ============================================================
 library ieee;
 use ieee.std_logic_1164.all;
@@ -17,7 +17,7 @@ entity fc2_controllers is
         cnt_weight_done : in  std_logic;
         cnt_neur_done   : in  std_logic;
         
-        -- Control de contadores (Ahora lógicamente síncronos)
+        -- Control de contadores
         cnt_in_en       : out std_logic;
         cnt_in_clr      : out std_logic;
         cnt_weight_en   : out std_logic;
@@ -27,7 +27,7 @@ entity fc2_controllers is
         
         -- Modos e interfaces
         act_wr          : out std_logic;
-        act_addr_sel    : out std_logic;
+        act_addr_sel    : out std_logic; 
         mac_en          : out std_logic;
         mac_clr         : out std_logic;
         
@@ -43,106 +43,88 @@ architecture rtl of fc2_controllers is
     type t_state is (S_LOAD, S_CALC, S_FLUSH, S_BIAS, S_ARGMAX, S_OUT, S_DONE);
     signal state     : t_state := S_LOAD;
     signal flush_cnt : unsigned(1 downto 0) := (others => '0');
+    signal r_cnt_neur_en : std_logic := '0';
 begin
 
-    -- Proceso de Transición de Estados y Lógica Síncrona
+    -- Máquina de Estados Secuencial
     process(clk) begin
         if rising_edge(clk) then
             if reset = '1' then
                 state <= S_LOAD;
                 flush_cnt <= (others => '0');
-                
-                -- Resets de salidas de control
-                cnt_in_en      <= '0';
-                cnt_in_clr     <= '0';
-                act_wr         <= '0';
-                act_addr_sel   <= '0';
-                mac_en         <= '0';
-                mac_clr        <= '0';
-                cnt_weight_en  <= '0';
-                cnt_weight_clr <= '0';
-                cnt_neur_en    <= '0';
-                cnt_neur_clr   <= '0';
-                argmax_reset   <= '0';
-                argmax_update  <= '0';
-                out_valid      <= '0';
-                layer_done     <= '0';
+                r_cnt_neur_en <= '0';
             else
-                -- Valores por defecto para evitar asignaciones latched/múltiples
-                cnt_in_en      <= '0';
-                cnt_in_clr     <= '0';
-                act_wr         <= '0';
-                mac_en         <= '0';
-                mac_clr        <= '0';
-                cnt_weight_en  <= '0';
-                cnt_weight_clr <= '0';
-                cnt_neur_en    <= '0';
-                cnt_neur_clr   <= '0';
-                argmax_reset   <= '0';
-                argmax_update  <= '0';
-                out_valid      <= '0';
-                
                 case state is
                     when S_LOAD =>
-                        act_addr_sel <= '0';
-                        layer_done   <= '0';
                         if en = '1' and valid_in = '1' then
-                            act_wr    <= '1';
-                            cnt_in_en <= '1';
                             if cnt_in_done = '1' then 
-                                cnt_in_clr   <= '1';
-                                mac_clr      <= '1';
-                                argmax_reset <= '1';
-                                state        <= S_CALC; 
+                                state <= S_CALC; 
                             end if;
                         end if;
-
+                        
                     when S_CALC =>
-                        act_addr_sel  <= '1';
-                        mac_en        <= '1';
-                        cnt_weight_en <= '1';
                         if cnt_weight_done = '1' then
-                            cnt_weight_clr <= '1';
-                            flush_cnt      <= (others => '0');
-                            state          <= S_FLUSH;
+                            flush_cnt <= (others => '0');
+                            state <= S_FLUSH;
                         end if;
-
+                        
                     when S_FLUSH =>
                         flush_cnt <= flush_cnt + 1;
                         if flush_cnt = 2 then 
                             state <= S_BIAS; 
                         end if;
-
+                        
                     when S_BIAS =>
                         state <= S_ARGMAX;
-
+                        
                     when S_ARGMAX =>
-                        argmax_update <= '1';
                         if cnt_neur_done = '1' then 
-                            cnt_neur_clr <= '1';
-                            state        <= S_OUT;
+                            r_cnt_neur_en <= '0';
+                            state <= S_OUT;
                         else 
-                            cnt_neur_en <= '1';
-                            mac_clr     <= '1';
-                            state       <= S_CALC; 
+                            r_cnt_neur_en <= '1'; 
+                            state <= S_CALC; 
                         end if;
-
+                        
                     when S_OUT =>  
-                        out_valid  <= '1';
-                        layer_done <= '1';
-                        state      <= S_DONE;
-
+                        state <= S_DONE;
+                        
                     when S_DONE => 
-                        layer_done <= '1';
+                        -- Permanecer en DONE si en = '1'. 
+                        -- Si en = '0', solo regresar a LOAD si se quita el reset o valid_in general.
                         if en = '0' then 
                             state <= S_LOAD; 
                         end if;
-
+                        
                     when others => 
                         state <= S_LOAD;
                 end case;
             end if;
         end if;
     end process;
+
+    -- Lógica de salidas combinacionales estrictas
+    cnt_in_en      <= '1' when state = S_LOAD and en = '1' and valid_in = '1' else '0';
+    cnt_in_clr     <= '1' when state = S_LOAD and en = '1' and valid_in = '1' and cnt_in_done = '1' else '0';
+    
+    act_wr         <= '1' when state = S_LOAD and en = '1' and valid_in = '1' else '0';
+    act_addr_sel   <= '0' when state = S_LOAD else '1';
+    
+    mac_en         <= '1' when state = S_CALC else '0';
+    mac_clr        <= '1' when state = S_ARGMAX or (state = S_LOAD and en = '1' and valid_in = '1' and cnt_in_done = '1') else '0';
+    
+    cnt_weight_en  <= '1' when state = S_CALC else '0';
+    cnt_weight_clr <= '1' when state = S_CALC and cnt_weight_done = '1' else '0';
+    
+    cnt_neur_en    <= r_cnt_neur_en when state = S_ARGMAX else '0';
+    cnt_neur_clr   <= '1' when state = S_ARGMAX and cnt_neur_done = '1' else '0';
+    
+    argmax_reset   <= '1' when state = S_LOAD and en = '1' and valid_in = '1' and cnt_in_done = '1' else '0';
+    argmax_update  <= '1' when state = S_ARGMAX else '0';
+    
+    -- Ajuste de banderas: out_valid solo en S_OUT. 
+    -- layer_done se mantiene arriba tanto en S_OUT como en S_DONE para el testbench.
+    out_valid      <= '1' when state = S_OUT else '0';
+    layer_done     <= '1' when state = S_OUT or state = S_DONE else '0';
 
 end architecture;

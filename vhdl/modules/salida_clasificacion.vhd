@@ -1,6 +1,7 @@
 -- ============================================================
--- Modulo: salida_clasificacion.vhd (100% ESTRUCTURAL PURO)
--- Descripcion: Capa FC2 + Argmax sin procesos ni logica local.
+-- Modulo: salida_clasificacion.vhd (ESTRUCUTURAL SEGURO)
+-- Descripcion: Capa FC2 + Argmax. Aislamiento total de lazos
+--              combinacionales mediante registros de pipeline.
 -- ============================================================
 library ieee;
 use ieee.std_logic_1164.all;
@@ -82,6 +83,17 @@ architecture structural of salida_clasificacion is
         );
     end component;
 
+    component registro is
+        generic ( N : integer := 8 );
+        port (
+            clk   : in  std_logic;
+            reset : in  std_logic;
+            en    : in  std_logic;
+            d     : in  std_logic_vector(N-1 downto 0);
+            q     : out std_logic_vector(N-1 downto 0)
+        );
+    end component;
+
     -- ── CABLES INTERNOS ──────────────────────────────────────
     signal cnt_in_en, cnt_weight_en, cnt_neur_en : std_logic;
     signal cnt_in_clr, cnt_weight_clr, cnt_neur_clr : std_logic;
@@ -90,6 +102,7 @@ architecture structural of salida_clasificacion is
     
     signal act_wr, act_addr_sel, mac_en, mac_en_d, mac_clr : std_logic;
     signal argmax_update, argmax_reset : std_logic;
+    signal argmax_update_reg, argmax_reset_reg : std_logic;
     
     signal act_addr : std_logic_vector(5 downto 0);
     signal w_addr   : std_logic_vector(9 downto 0);
@@ -99,7 +112,7 @@ architecture structural of salida_clasificacion is
 
 begin
 
-    -- Instancia 1: FSM
+    -- Instancia 1: FSM Principal
     U_CTRL : fc2_controllers
         port map (
             clk => clk, reset => reset, en => en, valid_in => valid_in,
@@ -110,7 +123,7 @@ begin
             out_valid => valid_out, layer_done => done
         );
 
-    -- Instancia 2: Contadores (Con MUX de direcciones interno)
+    -- Instancia 2: Contadores
     U_COUNTERS : fc2_counters
         generic map (N_IN => N_IN, N_OUT => N_OUT)
         port map (
@@ -121,11 +134,35 @@ begin
             act_addr => act_addr, w_addr => w_addr
         );
 
-    -- Instancia 3: Memorias
+    -- Instancia 3: Memorias Local RAM/ROM
     U_MEMS : fc2_memories
         port map (
             clk => clk, act_wr => act_wr, act_addr => act_addr, act_din => std_logic_vector(data_in), act_dout => act_dout,
             w_addr => w_addr, w_dout => w_dout, b_addr => cnt_neur_val, b_dout => b_dout
+        );
+
+    -- ── REGISTRO DE PIPELINE 1: Control de Habilitación del MAC ──
+    U_REG_MAC : registro
+        generic map (N => 1)
+        port map (
+            clk   => clk,
+            reset => reset,
+            en    => '1',
+            d(0)  => mac_en,
+            q(0)  => mac_en_d
+        );
+
+    -- ── REGISTRO DE PIPELINE 2: Rompe lazo crítico de control Argmax ──
+    U_REG_ARGMAX : registro
+        generic map (N => 2)
+        port map (
+            clk   => clk,
+            reset => reset,
+            en    => '1',
+            d(0)  => argmax_update,
+            d(1)  => argmax_reset,
+            q(0)  => argmax_update_reg,
+            q(1)  => argmax_reset_reg
         );
 
     -- Instancia 4: Multiplicador-Acumulador
@@ -135,18 +172,18 @@ begin
             a => signed(act_dout), b => signed(w_dout), acc => mac_acc
         );
 
-    -- Instancia 5: Camino de datos (Con registro de retardo interno)
+    -- Instancia 5: Camino de datos (Mapeado con señales registradas anti-lazos)
     U_DATAPATH : fc2_datapath
         port map (
             clk           => clk,
             reset         => reset,
-            argmax_reset  => argmax_reset,
-            argmax_update => argmax_update,
+            argmax_reset  => argmax_reset_reg,  -- Señal limpia de registro
+            argmax_update => argmax_update_reg, -- Señal limpia de registro
             mac_en        => mac_en,
             mac_acc       => mac_acc,
             b_dout        => b_dout,
             cnt_neur_val  => cnt_neur_val,
-            mac_en_d      => mac_en_d,
+            mac_en_d      => open,
             class_out     => class_out
         );
 

@@ -1,5 +1,5 @@
 -- ============================================================
--- Modulo: fc2_datapath.vhd (CON REGISTRO DE RETARDO INTERNO)
+-- Modulo: fc2_datapath.vhd (ESTABLE SIN LAZOS)
 -- ============================================================
 library ieee;
 use ieee.std_logic_1164.all;
@@ -11,13 +11,13 @@ entity fc2_datapath is
         reset         : in  std_logic;
         argmax_reset  : in  std_logic;
         argmax_update : in  std_logic;
-        mac_en        : in  std_logic;  -- Recibe mac_en directo de la FSM
+        mac_en        : in  std_logic;
         
         mac_acc       : in  signed(23 downto 0);
         b_dout        : in  std_logic_vector(7 downto 0);
         cnt_neur_val  : in  std_logic_vector(3 downto 0);
         
-        mac_en_d      : out std_logic;  -- Entrega el mac_en retrasado para el MAC
+        mac_en_d      : out std_logic;
         class_out     : out std_logic_vector(3 downto 0)
     );
 end entity;
@@ -29,15 +29,10 @@ architecture rtl of fc2_datapath is
     signal r_max_idx      : std_logic_vector(3 downto 0) := (others => '0');
 begin
 
-    -- REGISTRO DE RETARDO PARA COMPENSAR LA BRAM (Movido aquí)
-    process(clk) begin
-        if rising_edge(clk) then 
-            mac_en_d <= mac_en; 
-        end if;
-    end process;
-
+    -- Extensión de signo segura y suma combinacional del Bias
     biased_acc <= mac_acc + resize(signed(b_dout), 24);
 
+    -- Registro síncrono del Argmax
     process(clk) begin
         if rising_edge(clk) then
             if reset = '1' or argmax_reset = '1' then
@@ -52,5 +47,7 @@ begin
         end if;
     end process;
 
+    -- Salida directa registrada
     class_out <= r_max_idx;
+    mac_en_d  <= mac_en; -- Bypass directo o herencia
 end architecture;
